@@ -1,0 +1,113 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing release tag to update
+        required: true
+        default: v0.0.1
+      source_ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Install ISO build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes grub-pc-bin grub-common xorriso mtools \
+            qemu-system-x86 gdb zip
+
+      - name: Build kernel and bootable ISO
+        run: make CC=gcc iso
+
+      - name: Verify Multiboot2 kernel
+        run: grub-file --is-x86-multiboot2 build/kernel.elf
+
+      - name: Smoke-test ISO boot
+        run: |
+          set -eu
+          qemu-system-x86_64 \
+            -machine pc -m 128M -cdrom build/leptoos.iso \
+            -display none -serial none -monitor none \
+            -no-reboot -no-shutdown -S -gdb tcp:127.0.0.1:12347 &
+          qemu_pid=$!
+          trap 'kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true' EXIT
+          sleep 1
+          timeout 20s gdb -q -batch build/kernel.elf \
+            -ex 'set debuginfod enabled off' \
+            -ex 'target remote 127.0.0.1:12347' \
+            -ex 'hbreak kmain' \
+            -ex 'continue' \
+            -ex 'printf "Reached kmain successfully\n"' \
+            -ex 'set confirm off' \
+            -ex 'detach'
+
+      - name: Prepare release assets
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          mkdir -p release-assets
+          cp build/leptoos.iso "release-assets/leptoos-${RELEASE_TAG}.iso"
+          cp build/kernel.elf "release-assets/leptoos-kernel-${RELEASE_TAG}.elf"
+          {
+            printf 'LeptoOS %s\n' "$RELEASE_TAG"
+            printf 'Commit: %s\n' "$COMMIT_SHA"
+            printf 'Bootable image: leptoos-%s.iso\n' "$RELEASE_TAG"
+            printf 'Kernel ELF: leptoos-kernel-%s.elf\n' "$RELEASE_TAG"
+          } > release-assets/LEPTOOS-BUILD-INFO.txt
+          (
+            cd release-assets
+            zip "leptoos-${RELEASE_TAG}-artifacts.zip" \
+              "leptoos-${RELEASE_TAG}.iso" \
+              "leptoos-kernel-${RELEASE_TAG}.elf" \
+              LEPTOOS-BUILD-INFO.txt
+            sha256sum ./*.iso ./*.elf ./*.zip > LEPTOOS-SHA256SUMS
+          )
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          name: LeptoOS ${{ inputs.tag_name || github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Remove legacy SmallOS release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          set -eu
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets > "$RUNNER_TEMP/release-assets.json"
+          jq -r '.assets[].name | select(
+            startswith("smallos-") or
+            startswith("kernel-") or
+            . == "BUILD-INFO.txt" or
+            . == "SHA256SUMS"
+          )' "$RUNNER_TEMP/release-assets.json" |
+            while IFS= read -r asset; do
+              gh release delete-asset "$RELEASE_TAG" "$asset" \
+                --repo "$GITHUB_REPOSITORY" --yes
+            done
